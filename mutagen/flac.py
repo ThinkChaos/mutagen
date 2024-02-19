@@ -781,7 +781,7 @@ class FLAC(mutagen.FileType):
     @convert_error(IOError, error)
     @loadfile()
     def load(self, filething):
-        """Load file information from a filename."""
+        """Load information from a file."""
 
         fileobj = filething.fileobj
 
@@ -795,11 +795,6 @@ class FLAC(mutagen.FileType):
         while self.__read_metadata_block(fileobj):
             pass
 
-        try:
-            self.info.length
-        except (AttributeError, IndexError):
-            raise FLACNoHeaderError("Stream info block not found")
-
         if self.info.length:
             start = fileobj.tell()
             fileobj.seek(0, 2)
@@ -810,11 +805,10 @@ class FLAC(mutagen.FileType):
 
     @property
     def info(self):
-        streaminfo_blocks = [
-            block for block in self.metadata_blocks
-            if block.code == StreamInfo.code
-        ]
-        return streaminfo_blocks[0]
+        for block in self.metadata_blocks:
+            if block.code == StreamInfo.code:
+                return block
+        raise FLACNoHeaderError("Stream info block not found")  # only ever raised by __init__
 
     def add_picture(self, picture):
         """Add a new picture to the file.
