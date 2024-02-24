@@ -5,6 +5,8 @@
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 
+from typing import Optional
+
 from ._util import loadfile
 
 
@@ -30,24 +32,46 @@ class PaddingInfo(object):
     :meth:`get_default_padding` method in the callback.
 
     Attributes:
-        padding (`int`): The amount of padding left after saving in bytes
-            (can be negative if more data needs to be added as padding is
-            available)
-        size (`int`): The amount of data following the padding
+        size_diff (`int`): The amount metadata added or removed compared to the
+            original. Negative in case new metadata is smaller.
+        new_tail_size (`int`): The amount of data following the padding
+        new_head_size (`int | None`): The amount of bytes preceding the padding
+        fs_block_size (`int | None`): The filesystem block size
     """
 
-    def __init__(self, padding: int, size: int):
-        self.padding = padding
-        self.size = size
+    # TODO?: cleanup args if changing the function signature is ok
+    def __init__(self, padding: int, new_tail_size: int,
+                 new_head_size: Optional[int] = None,
+                 fs_block_size: Optional[int] = None):
+        self.size_diff = -padding
+        self.new_tail_size = new_tail_size
+        self.new_head_size = new_head_size
+        self.fs_block_size = fs_block_size
+
+        # Back-compat
+        self.padding = -self.size_diff
+        self.size = self.new_tail_size
 
     def get_default_padding(self) -> int:
-        """The default implementation which tries to select a reasonable
-        amount of padding and which might change in future versions.
+        """The default implementation is currently equivalent to the "sharing"
+        algorithm.
+        The algorithm and return value can change between versions.
 
         Returns:
             int: Amount of padding after saving
         """
 
+        # TODO?: default to storage when self.fs_block_size is not None
+        return self.get_padding_for_sharing()
+
+    def get_padding_for_sharing(self) -> int:
+        """Tries to select an amount that is big enough to make future edits,
+        while staying reasonably small.
+        The return value can change between versions.
+
+        Returns:
+            int: Amount of padding after saving
+        """
         high = 1024 * 10 + self.size // 100  # 10 KiB + 1% of trailing data
         low = 1024 + self.size // 1000  # 1 KiB + 0.1% of trailing data
 
@@ -61,6 +85,36 @@ class PaddingInfo(object):
         else:
             # not enough padding, add some
             return low
+
+    def get_padding_for_storage(self) -> int:
+        """Selects an amount that causes the least filesystem block changes.
+        The return value can change between versions.
+
+        The point of this strategy is to avoid rewriting more data than needed.
+        This improves performance by reducing the amout we actually copy,
+        which also greatly improves storage use for copy-on-write filesystems.
+
+        Returns:
+            int: Amount of padding after saving
+        """
+        if self.new_head_size is None:
+            raise ValueError("get_padding_for_storage requires new_head_size")
+
+        if self.fs_block_size is None:
+            raise ValueError("get_padding_for_storage requries fs_block_size")
+
+        old_head_size = self.new_head_size - self.size_diff
+        old_align = old_head_size % self.fs_block_size
+
+        # Ensure metadata + padding is block aligned
+        res = self.fs_block_size - (self.new_head_size % self.fs_block_size)
+
+        # Ensure old offset in the following block is preserved
+        # This is makes all following blocks stay the same
+        res += old_align
+
+        # Don't exceed a single block (can happen when new_head_size <= old_align)
+        return res % self.fs_block_size
 
     def _get_padding(self, user_func):
         if user_func is None:

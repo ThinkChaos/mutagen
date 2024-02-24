@@ -691,6 +691,7 @@ class FileRewriter:
     def __enter__(self):
         if not hasattr(os, "copy_file_range") or not self._is_os_file(self.out):
             self.tmp = None
+            self.fs_block_size = None
         else:
             # FIXME: try/except + fallback: it might not be possible to create files
             self.tmp_ctx = _openfile(None, None,

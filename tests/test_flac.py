@@ -80,12 +80,12 @@ class TMetadataBlock(TestCase):
         block = Picture()
         block.data = b"\x00" * 0x1FFFFFF
         self.assertRaises(
-            error, MetadataBlock._writeblocks, [block], 0, 0, None)
+            error, MetadataBlock._writeblocks, [block], 0, 0, 0, None, None)
 
     def test_too_large_padding(self):
         block = Padding()
         self.assertEqual(
-            len(MetadataBlock._writeblocks([block], 0, 0, lambda x: 2 ** 24)),
+            len(MetadataBlock._writeblocks([block], 0, 0, 0, None, lambda x: 2 ** 24)),
             2**24 - 1 + 4)
 
 

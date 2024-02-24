@@ -143,7 +143,7 @@ class MetadataBlock(object):
         return data
 
     @classmethod
-    def _writeblocks(cls, blocks, available, cont_size, padding_func):
+    def _writeblocks(cls, blocks, old_head_size, new_head_size, content_size, fs_block_size, padding_func):
         """Render metadata block as a byte string."""
 
         # write everything except padding
@@ -152,17 +152,20 @@ class MetadataBlock(object):
             if isinstance(block, Padding):
                 continue
             data += cls._writeblock(block)
-        blockssize = len(data)
+        new_head_size += len(data)
 
         # take the padding overhead into account. we always add one
         # to make things simple.
         padding_block = Padding()
-        blockssize += len(cls._writeblock(padding_block))
+        new_head_size += len(cls._writeblock(padding_block))
+
+        size_diff = new_head_size - old_head_size
 
         # finally add a padding block
-        info = PaddingInfo(available - blockssize, cont_size)
+        info = PaddingInfo(-size_diff, content_size, new_head_size, fs_block_size)
         padding_block.length = min(info._get_padding(padding_func),
                                    cls._MAX_SIZE)
+
         data += cls._writeblock(padding_block, is_last=True)
 
         return data
@@ -762,7 +765,7 @@ class FLAC(mutagen.FileType):
 
     @convert_error(IOError, error)
     @loadfile(writable=True)
-    def delete(self, filething=None):
+    def delete(self, filething=None, padding=lambda _: 0):  # TODO? change default
         """Remove Vorbis comments from a file.
 
         If no filename is given, the one most recently loaded is used.
@@ -771,7 +774,7 @@ class FLAC(mutagen.FileType):
         if self.tags is not None:
             temp_blocks = [
                 b for b in self.metadata_blocks if b.code != VCFLACDict.code]
-            self._save(filething, temp_blocks, False, padding=lambda x: 0)
+            self._save(filething, temp_blocks, False, padding)
             self.metadata_blocks[:] = [
                 b for b in self.metadata_blocks
                 if b.code != VCFLACDict.code or b is self.tags]
@@ -882,12 +885,15 @@ class FLAC(mutagen.FileType):
 
         content_size = end - (start + audio_offset)
         assert content_size >= 0
-        metadata_bytes = MetadataBlock._writeblocks(
-            metadata_blocks, available, content_size, padding)
 
         f.seek(0, os.SEEK_SET)
 
         with FileRewriter(filething) as w:
+            metadata_bytes = MetadataBlock._writeblocks(
+                metadata_blocks, audio_offset, header, content_size,
+                w.fs_block_size,
+                padding)
+
             w.drop_bytes(start)
 
             # ID3v2, if any, and b"fLaC"
@@ -896,6 +902,9 @@ class FLAC(mutagen.FileType):
             # Update metadata
             old_meta_size = audio_offset - header
             w.replace_bytes(old_meta_size, metadata_bytes)
+            if w.tmp is not None and padding == PaddingInfo.get_padding_for_storage:
+                assert w.tmp.fileobj.tell() % w.fs_block_size \
+                    == audio_offset % w.fs_block_size
 
             # Audio, and ID3v1, if any
             w.keep_bytes(content_size)
