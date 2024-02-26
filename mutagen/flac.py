@@ -21,12 +21,13 @@ http://flac.sourceforge.net/format.html
 
 __all__ = ["FLAC", "Open", "delete"]
 
+import os
 import struct
 from io import BytesIO
 from ._vorbis import VCommentDict
 import mutagen
 
-from mutagen._util import resize_bytes, MutagenError, get_size, loadfile, \
+from mutagen._util import FileRewriter, MutagenError, get_size, loadfile, \
     convert_error, bchr, endswith
 from mutagen._tags import PaddingInfo
 from mutagen.id3._util import BitPaddedInt
@@ -58,14 +59,14 @@ class StrictFileObject(object):
     def __init__(self, fileobj):
         self._fileobj = fileobj
         for m in ["close", "tell", "seek", "write", "name", "flush",
-                  "truncate"]:
+                  "truncate", "fileno"]:
             if hasattr(fileobj, m):
                 setattr(self, m, getattr(fileobj, m))
 
     def read(self, size=-1):
         data = self._fileobj.read(size)
         if size >= 0 and len(data) != size:
-            raise error("file said %d bytes, read %d bytes" % (
+            raise error("asked for %d bytes, read %d bytes" % (
                         size, len(data)))
         return data
 
@@ -808,7 +809,9 @@ class FLAC(mutagen.FileType):
         for block in self.metadata_blocks:
             if block.code == StreamInfo.code:
                 return block
-        raise FLACNoHeaderError("Stream info block not found")  # only ever raised by __init__
+
+        # only ever raised during __init__
+        raise FLACNoHeaderError("Stream info block not found")
 
     def add_picture(self, picture):
         """Add a new picture to the file.
@@ -859,34 +862,48 @@ class FLAC(mutagen.FileType):
         # "fLaC" and maybe ID3
         available = audio_offset - header
 
+        start = 0
+        end = get_size(f)
+
         # Delete ID3v2
         if deleteid3 and header > 4:
-            available += header - 4
+            start = header - 4
             header = 4
-
-        content_size = get_size(f) - audio_offset
-        assert content_size >= 0
-        data = MetadataBlock._writeblocks(
-            metadata_blocks, available, content_size, padding)
-        data_size = len(data)
-
-        resize_bytes(filething.fileobj, available, data_size, header)
-        f.seek(header - 4)
-        f.write(b"fLaC")
-        f.write(data)
 
         # Delete ID3v1
         if deleteid3:
             try:
-                f.seek(-128, 2)
+                f.seek(-128, os.SEEK_END)
             except IOError:
                 pass
             else:
                 if f.read(3) == b"TAG":
-                    f.seek(-128, 2)
-                    f.truncate()
+                    end -= 128
+
+        content_size = end - (start + audio_offset)
+        assert content_size >= 0
+        metadata_bytes = MetadataBlock._writeblocks(
+            metadata_blocks, available, content_size, padding)
+
+        f.seek(0, os.SEEK_SET)
+
+        with FileRewriter(filething) as w:
+            w.drop_bytes(start)
+
+            # ID3v2, if any, and b"fLaC"
+            w.keep_bytes(header)
+
+            # Update metadata
+            old_meta_size = audio_offset - header
+            w.replace_bytes(old_meta_size, metadata_bytes)
+
+            # Audio, and ID3v1, if any
+            w.keep_bytes(content_size)
 
     def __find_audio_offset(self, fileobj):
+        """Returns the offset of the audio data start.
+        The passed fileobj will be advanced to that offset as well.
+        """
         byte = 0x00
         while not (byte & 0x80):
             byte = ord(fileobj.read(1))
@@ -919,9 +936,9 @@ class FLAC(mutagen.FileType):
                 fileobj.seek(size - 4)
                 if fileobj.read(4) != b"fLaC":
                     size = None
-        if size is None:
-            raise FLACNoHeaderError(
-                "%r is not a valid FLAC file" % name)
+            if size is None:
+                raise FLACNoHeaderError(
+                    "%r is not a valid FLAC file" % name)
         return size
 
 

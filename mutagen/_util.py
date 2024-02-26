@@ -11,6 +11,7 @@ You should not rely on the interfaces here being stable. They are
 intended for internal use in Mutagen only.
 """
 
+import os
 import sys
 import struct
 import codecs
@@ -681,6 +682,159 @@ def seek_end(fileobj, offset: int) -> None:
         fileobj.seek(0, 0)
     else:
         fileobj.seek(-offset, 2)
+
+
+class FileRewriter:
+    def __init__(self, filething: FileThing):
+        self.out = filething
+
+    def __enter__(self):
+        if not hasattr(os, "copy_file_range") or not self._is_os_file(self.out):
+            self.tmp = None
+        else:
+            # FIXME: try/except + fallback: it might not be possible to create files
+            self.tmp_ctx = _openfile(None, None,
+                                     f"{self.out.filename}.mutagen.tmp", None,
+                                     writable=True, create=True)
+            self.tmp = self.tmp_ctx.__enter__()
+
+            # FIXME: os.fstatvfs might not be defined (Windows)
+            self.fs_block_size = os.fstatvfs(self.out.fileobj.fileno()).f_bsize
+
+        return self
+
+    def __exit__(self, exc_typ, exc_value, traceback):
+        if self.tmp is None:
+            self.out.fileobj.truncate()
+            return
+
+        # TODO: due diligence about when syncing is required
+        self.out.fileobj.flush()
+        # self.tmp.fileobj.flush()
+        os.fsync(self.out.fileobj.fileno())
+        # os.fsync(self.tmp.fileobj.fileno())
+
+        count = self.tmp.fileobj.tell()
+        self.out.fileobj.seek(0, os.SEEK_SET)
+        self.tmp.fileobj.seek(0, os.SEEK_SET)
+        count -= _copy_file_range(self.tmp.fileobj.fileno(),
+                                  self.out.fileobj.fileno(),
+                                  count)
+        count -= _copy_bytes(self.tmp.fileobj,
+                             self.out.fileobj,
+                             count,
+                             max(self.fs_block_size, _DEFAULT_BUFFER_SIZE))
+        self.out.fileobj.truncate()
+
+        self.tmp_ctx.__exit__(exc_typ, exc_value, traceback)
+        os.remove(self.tmp.filename)
+
+    @staticmethod
+    def _is_os_file(filething: FileThing):
+        if filething.filename is None:
+            # TODO: check if we create a file on the same FS without a filename
+            return None
+
+        try:
+            return filething.fileobj.fileno()
+        except OSError:
+            return None
+
+    def keep_bytes(self, count):
+        """Keep `count` bytes unchanged, advancing the offset in the file."""
+        if count < 0:
+            raise ValueError(f"count cannot be negative: {count}")
+
+        if self.tmp is None:
+            self.out.fileobj.seek(count, os.SEEK_CUR)
+            return
+
+        # self.out.fileobj.flush()
+        self.tmp.fileobj.flush()
+        # os.fsync(self.out.fileobj.fileno())
+        os.fsync(self.tmp.fileobj.fileno())
+
+        # Do a first copy to reach a block boundary
+        # This seems to be required, at least by ZFS 2.2.2, for the next
+        # copy_file_range to actually share the backing blocks
+        unaligned = self.out.fileobj.tell() % self.fs_block_size
+        count -= _copy_file_range(self.out.fileobj.fileno(),
+                                  self.tmp.fileobj.fileno(),
+                                  min(count, self.fs_block_size - unaligned))
+
+        count -= _copy_file_range(self.out.fileobj.fileno(),
+                                  self.tmp.fileobj.fileno(),
+                                  count)
+
+        # Manual copy, as a fallback, or for leftover data
+        count -= _copy_bytes(self.out.fileobj,
+                             self.tmp.fileobj,
+                             count,
+                             max(self.fs_block_size, _DEFAULT_BUFFER_SIZE))
+
+    def drop_bytes(self, count):
+        """Remove count bytes starting at the current offset."""
+        self.replace_bytes(count, b"")
+
+    def replace_bytes(self, old_size, buff):
+        """Replace `old_size` bytes, starting at the current offset,
+        with the contents of buff."""
+        if self.tmp is None:
+            # TODO?: this sequence could be optimized by directly inserting
+            #        bytes from buff instead of putting zeroes first
+            #        Might not be worth the trouble though
+            pos = self.out.fileobj.tell()
+            resize_bytes(self.out.fileobj, old_size, len(buff),
+                         pos)
+            self.out.fileobj.seek(pos, os.SEEK_SET)
+            self.out.fileobj.write(buff)
+            return
+
+        self.out.fileobj.seek(old_size, os.SEEK_CUR)
+        self.tmp.fileobj.write(buff)
+
+    def insert_bytes(self, buff):
+        """Copy the contents of buff to the current offset,
+        shifting any following data.
+        """
+        if self.tmp is None:
+            pos = self.out.fileobj.tell()
+            # TODO?: same as in replace_bytes, insert buff directly
+            insert_bytes(self.out, len(buff), pos)
+            self.out.fileobj.seek(pos)
+            self.out.fileobj.write(buff)
+            return
+
+        self.tmp.fileobj.write(buff)
+
+
+def _copy_bytes(fsrc, fdst, n: int, BUFFER_SIZE: int = _DEFAULT_BUFFER_SIZE):
+    copied = 0
+    while copied < n:
+        buff = fsrc.read(min(BUFFER_SIZE, n))
+        if len(buff) == 0:
+            break
+
+        fdst.write(buff)
+        copied += len(buff)
+
+    return copied
+
+
+def _copy_file_range(src_fd, dst_fd, n):
+    copied = 0
+    while copied < n:
+        try:
+            chunk = os.copy_file_range(src_fd, dst_fd, n - copied)
+            if chunk == 0:
+                break
+            copied += chunk
+        except OSError as e:
+            if e.errno == errno.EAGAIN:
+                continue
+            raise
+
+    return copied
 
 
 def resize_file(fobj, diff: int, BUFFER_SIZE: int = _DEFAULT_BUFFER_SIZE) -> None:
